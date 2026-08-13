@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Calculadora de Cambios - REMEX L.A.</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 min-h-screen flex items-center justify-center p-4">
+
+  <div class="bg-white shadow-xl rounded-2xl p-6 w-full max-w-md border border-gray-200">
+    <!-- Encabezado -->
+    <div class="text-center mb-6">
+      <h1 class="text-2xl font-bold text-gray-800">REMEX L.A.</h1>
+      <p class="text-xs text-gray-500 uppercase tracking-widest mt-1">Calculadora de Cambios</p>
+    </div>
+
+    <!-- Formulario Principal -->
+    <form id="exchange-form" class="space-y-4">
+      
+      <!-- Tú Envías -->
+      <div>
+        <label class="block text-xs font-semibold text-gray-600 uppercase mb-1">Tú Envías</label>
+        <div class="flex">
+          <input type="number" id="monto-envia" value="100" step="any" required
+            class="w-2/3 p-2.5 border border-r-0 border-gray-300 rounded-l-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-800 font-semibold">
+          <select id="moneda-origen"
+            class="w-1/3 p-2.5 border border-gray-300 rounded-r-lg bg-gray-50 text-gray-700 font-semibold focus:outline-none">
+            <option value="VES">VES (Bs)</option>
+            <option value="COP">COP ($)</option>
+            <option value="USDT">USDT ($)</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Tú Recibes (Editable para cálculo bidireccional) -->
+      <div>
+        <label class="block text-xs font-semibold text-gray-600 uppercase mb-1">Tú Recibes</label>
+        <div class="flex">
+          <input type="number" id="monto-recibe" step="any" required
+            class="w-2/3 p-2.5 border border-r-0 border-gray-300 rounded-l-lg bg-white text-gray-800 font-bold focus:outline-none focus:ring-2 focus:ring-green-500">
+          <select id="moneda-destino"
+            class="w-1/3 p-2.5 border border-gray-300 rounded-r-lg bg-gray-50 text-gray-700 font-semibold focus:outline-none">
+            <option value="COP">COP ($)</option>
+            <option value="VES">VES (Bs)</option>
+            <option value="USDT" selected>USDT ($)</option>
+            <option value="ZINLI">ZINLI ($)</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Resumen de Tasa y Comisión -->
+      <div class="bg-gray-50 rounded-lg p-3 text-xs text-gray-600 space-y-1 border border-gray-100">
+        <div class="flex justify-between">
+          <span>Tasa aplicada:</span>
+          <span id="tasa-display" class="font-semibold text-gray-800">-</span>
+        </div>
+        <div class="flex justify-between">
+          <span>Comisión / Servicio:</span>
+          <span id="comision-display" class="font-semibold text-gray-800">-</span>
+        </div>
+      </div>
+
+      <!-- Campos Dinámicos según Destino -->
+      <div id="dynamic-fields" class="space-y-3 pt-2">
+        <!-- Se rellenan automáticamente mediante JS -->
+      </div>
+
+      <!-- Mensaje de Error / Alerta -->
+      <div id="error-message" class="hidden text-xs text-red-600 font-medium bg-red-50 p-2.5 rounded-lg border border-red-200">
+        <!-- Mensaje dinámico de error -->
+      </div>
+
+      <!-- Botón de Envío -->
+      <button type="submit" id="btn-submit"
+        class="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 rounded-lg shadow-md transition duration-200 flex items-center justify-center gap-2">
+        <span>Solicitar Cambio vía WhatsApp</span>
+      </button>
+
+    </form>
+  </div>
+
+  <script>
+    // ==========================================
+    // ⚙️ CONFIGURACIÓN GENERAL
+    // ==========================================
+    const CONFIG = {
+      // Tasas base
+      COP_USDT: 3140,       // Tasa Nequi
+      VES_USDT: 882,        // Tasa Pago Móvil
+
+      // Configuración Zinli
+      ZINLI_TASA_BASE: 880,   // Tasa base por cada USD Zinli en VES
+      ZINLI_RECARGO: 0.10,    // 10% de recargo sobre la tasa base
+      ZINLI_MIN_USD: 10.00,   // Límite mínimo a recibir en Zinli (USD)
+
+      // Comisiones generales
+      COMISION_GENERAL: 0.04, // 4%
+      COMISION_USDT: 0.03,    // 3%
+
+      // Número de atención de WhatsApp
+      WHATSAPP_NUMBER: "584246429932"
+    };
+
+    // ==========================================
+    // 📌 ELEMENTOS DEL DOM
+    // ==========================================
+    const montoEnvia = document.getElementById('monto-envia');
+    const monedaOrigen = document.getElementById('moneda-origen');
+    const montoRecibe = document.getElementById('monto-recibe');
+    const monedaDestino = document.getElementById('moneda-destino');
+    const tasaDisplay = document.getElementById('tasa-display');
+    const comisionDisplay = document.getElementById('comision-display');
+    const dynamicFields = document.getElementById('dynamic-fields');
+    const errorMessage = document.getElementById('error-message');
+    const btnSubmit = document.getElementById('btn-submit');
+
+    let esOperacionValida = true;
+
+    // ==========================================
+    // 🧮 LÓGICA DE CÁLCULO Y TASAS
+    // ==========================================
+    function obtenerDatosConversion() {
+      const origen = monedaOrigen.value;
+      const destino = monedaDestino.value;
+
+      if (origen === destino) {
+        return { tasaFactor: 1, textoTasa: "1.00", textoComision: "0%" };
+      }
+
+      // 1. ZINLI (VES -> ZINLI)
+      if (origen === 'VES' && destino === 'ZINLI') {
+        const tasaEfectivaZinli = CONFIG.ZINLI_TASA_BASE * (1 + CONFIG.ZINLI_RECARGO);
+        return {
+          tasaFactor: 1 / tasaEfectivaZinli,
+          textoTasa: `${tasaEfectivaZinli.toFixed(2)} VES/USD`,
+          textoComision: `${(CONFIG.ZINLI_RECARGO * 100)}% Recargo Incluido`,
+          esZinli: true,
+          tasaEfectivaZinli: tasaEfectivaZinli
+        };
+      }
+
+      // Restricción Zinli desde otras monedas
+      if (destino === 'ZINLI' && origen !== 'VES') {
+        return { error: "Zinli solo está disponible para envíos desde Bolívares (VES)." };
+      }
+
+      // 2. RESTO DE MONEDAS
+      let tasaFactor = 0;
+      let comision = CONFIG.COMISION_GENERAL;
+      let textoTasa = "";
+
+      if (origen === 'USDT' && destino === 'VES') {
+        comision = CONFIG.COMISION_USDT; // 3% de comisión (882 * 0.97 = 855.54)
+        tasaFactor = CONFIG.VES_USDT * (1 - comision);
+        textoTasa = `${tasaFactor.toFixed(2)} VES/USDT`;
+
+      } else if (origen === 'COP' && destino === 'VES') {
+        const tasaBase = CONFIG.VES_USDT / CONFIG.COP_USDT;
+        tasaFactor = tasaBase * (1 - comision);
+        textoTasa = `${tasaFactor.toFixed(4)} VES/COP`;
+
+      } else if (origen === 'VES' && destino === 'COP') {
+        const tasaBase = CONFIG.COP_USDT / CONFIG.VES_USDT;
+        tasaFactor = tasaBase * (1 - comision);
+        textoTasa = `${tasaFactor.toFixed(4)} COP/VES`;
+
+      } else if (origen === 'USDT' && destino === 'COP') {
+        comision = CONFIG.COMISION_USDT;
+        tasaFactor = CONFIG.COP_USDT * (1 - comision);
+        textoTasa = `${tasaFactor.toFixed(2)} COP/USDT`;
+
+      } else if (origen === 'COP' && destino === 'USDT') {
+        comision = CONFIG.COMISION_USDT;
+        const tasaBase = 1 / CONFIG.COP_USDT;
+        tasaFactor = tasaBase * (1 - comision);
+        const tasaEfectiva = CONFIG.COP_USDT / (1 - comision);
+        textoTasa = `${tasaEfectiva.toFixed(2)} COP/USDT`;
+
+      } else if (origen === 'VES' && destino === 'USDT') {
+        comision = CONFIG.COMISION_USDT;
+        const tasaBase = 1 / CONFIG.VES_USDT;
+        tasaFactor = tasaBase * (1 - comision);
+        const tasaEfectiva = CONFIG.VES_USDT / (1 - comision);
+        textoTasa = `${tasaEfectiva.toFixed(2)} VES/USDT`;
+      }
+
+      return {
+        tasaFactor: tasaFactor,
+        textoTasa: textoTasa,
+        textoComision: `${(comision * 100)}% (Incluida)`
+      };
+    }
+
+    // ==========================================
+    // 🔄 ACTUALIZACIÓN BIDIRECCIONAL
+    // ==========================================
+    function calcularOperacion(origenEvento = 'envia') {
+      ocultarError();
+      const datos = obtenerDatosConversion();
+
+      if (datos.error) {
+        mostrarError(datos.error);
+        montoRecibe.value = "";
+        tasaDisplay.innerText = "N/A";
+        comisionDisplay.innerText = "N/A";
+        return;
+      }
+
+      tasaDisplay.innerText = datos.textoTasa;
+      comisionDisplay.innerText = datos.textoComision;
+
+      if (origenEvento === 'envia') {
+        const cantidadEnvia = parseFloat(montoEnvia.value) || 0;
+        const resultadoRecibe = cantidadEnvia * datos.tasaFactor;
+        
+        montoRecibe.value = resultadoRecibe ? resultadoRecibe.toFixed(2) : "";
+
+        if (datos.esZinli) {
+          if (resultadoRecibe < CONFIG.ZINLI_MIN_USD) {
+            const vesMinimos = (CONFIG.ZINLI_MIN_USD * datos.tasaEfectivaZinli).toLocaleString('es-ES', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            mostrarError(`El monto mínimo para recargar Zinli es de $${CONFIG.ZINLI_MIN_USD.toFixed(2)} USD (aprox. ${vesMinimos} VES).`);
+          }
+        }
+
+      } else if (origenEvento === 'recibe') {
+        const cantidadRecibe = parseFloat(montoRecibe.value) || 0;
+        const resultadoEnvia = cantidadRecibe / datos.tasaFactor;
+
+        montoEnvia.value = resultadoEnvia ? resultadoEnvia.toFixed(2) : "";
+
+        if (datos.esZinli) {
+          if (cantidadRecibe < CONFIG.ZINLI_MIN_USD) {
+            const vesMinimos = (CONFIG.ZINLI_MIN_USD * datos.tasaEfectivaZinli).toLocaleString('es-ES', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            mostrarError(`El monto mínimo para recargar Zinli es de $${CONFIG.ZINLI_MIN_USD.toFixed(2)} USD (aprox. ${vesMinimos} VES).`);
+          }
+        }
+      }
+    }
+
+    // Funciones Auxiliares para Manejo de Errores
+    function mostrarError(mensaje) {
+      errorMessage.innerText = mensaje;
+      errorMessage.classList.remove('hidden');
+      btnSubmit.disabled = true;
+      btnSubmit.classList.add('opacity-50', 'cursor-not-allowed');
+      esOperacionValida = false;
+    }
+
+    function ocultarError() {
+      errorMessage.innerText = '';
+      errorMessage.classList.add('hidden');
+      btnSubmit.disabled = false;
+      btnSubmit.classList.remove('opacity-50', 'cursor-not-allowed');
+      esOperacionValida = true;
+    }
+
+    // ==========================================
+    // 📝 RENDERIZADO DE CAMPOS DE DESTINO
+    // ==========================================
+    function renderizarCamposDestino() {
+      const destino = monedaDestino.value;
+      dynamicFields.innerHTML = '';
+
+      if (destino === 'COP') {
+        dynamicFields.innerHTML = `
+          <input type="text" id="titular-nequi" placeholder="Nombre y Apellido del Titular" required class="w-full p-2.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+          <input type="tel" id="tel-nequi" placeholder="Número Nequi (10 dígitos)" required class="w-full p-2.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+        `;
+      } else if (destino === 'VES') {
+        dynamicFields.innerHTML = `
+          <input type="text" id="banco-ves" placeholder="Banco (ej. Banesco, Mercantil)" required class="w-full p-2.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+          <input type="text" id="cedula-ves" placeholder="Cédula / RIF (ej. V-12345678)" required class="w-full p-2.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+          <input type="tel" id="tel-ves" placeholder="Teléfono Pago Móvil" required class="w-full p-2.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+        `;
+      } else if (destino === 'USDT') {
+        dynamicFields.innerHTML = `
+          <input type="text" id="binance-id" placeholder="Binance Pay ID / Correo registrado" required class="w-full p-2.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+        `;
+      } else if (destino === 'ZINLI') {
+        dynamicFields.innerHTML = `
+          <input type="email" id="zinli-account" placeholder="Correo electrónico registrado en Zinli" required class="w-full p-2.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+        `;
+      }
+    }
+
+    // ==========================================
+    // 🎧 EVENT LISTENERS
+    // ==========================================
+    montoEnvia.addEventListener('input', () => calcularOperacion('envia'));
+    montoRecibe.addEventListener('input', () => calcularOperacion('recibe'));
+
+    monedaOrigen.addEventListener('change', () => {
+      if (monedaOrigen.value === monedaDestino.value) {
+        monedaDestino.value = monedaOrigen.value === 'VES' ? 'COP' : 'VES';
+      }
+      renderizarCamposDestino();
+      calcularOperacion('envia');
+    });
+
+    monedaDestino.addEventListener('change', () => {
+      renderizarCamposDestino();
+      calcularOperacion('envia');
+    });
+
+    // Envío a WhatsApp
+    document.getElementById('exchange-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+
+      if (!esOperacionValida) return;
+
+      const idOrden = "ORD-" + Math.floor(1000 + Math.random() * 9000);
+      const fecha = new Date().toLocaleString('es-ES');
+      const envia = `${montoEnvia.value} ${monedaOrigen.value}`;
+      const recibe = `${montoRecibe.value} ${monedaDestino.value === 'ZINLI' ? 'USD (Zinli)' : monedaDestino.value}`;
+      const tasa = tasaDisplay.innerText;
+
+      let datosCliente = "";
+      const destino = monedaDestino.value;
+
+      if (destino === 'COP') {
+        const titular = document.getElementById('titular-nequi')?.value || '';
+        const tel = document.getElementById('tel-nequi')?.value || '';
+        datosCliente = `• Titular: ${titular}\n• N° Nequi: ${tel}`;
+      } else if (destino === 'VES') {
+        const banco = document.getElementById('banco-ves')?.value || '';
+        const cedula = document.getElementById('cedula-ves')?.value || '';
+        const tel = document.getElementById('tel-ves')?.value || '';
+        datosCliente = `• Banco: ${banco}\n• Cédula: ${cedula}\n• Teléfono: ${tel}`;
+      } else if (destino === 'USDT') {
+        const idBinance = document.getElementById('binance-id')?.value || '';
+        datosCliente = `• Binance Pay ID: ${idBinance}`;
+      } else if (destino === 'ZINLI') {
+        const email = document.getElementById('zinli-account')?.value || '';
+        datosCliente = `• Correo Zinli: ${email}`;
+      }
+
+      const mensaje = 
+`🚨 *NUEVA SOLICITUD DE CAMBIO - REMEX L.A.* 🚨
+-----------------------------------
+📋 *ID Orden:* #${idOrden}
+📅 *Fecha:* ${fecha}
+
+💵 *DETALLES:*
+• *Envías:* ${envia}
+• *Tasa Aplicada:* ${tasa}
+• *Recibes:* ${recibe}
+
+👤 *DATOS DESTINATARIO:*
+${datosCliente}
+-----------------------------------
+📌 *Por favor envíame los datos bancarios para realizar mi depósito y procesar el cambio.*`;
+
+      const url = `https://wa.me/${CONFIG.WHATSAPP_NUMBER}?text=${encodeURIComponent(mensaje)}`;
+      window.open(url, '_blank');
+    });
+
+    // INICIALIZACIÓN
+    renderizarCamposDestino();
+    calcularOperacion('envia');
+  </script>
+</body>
+</html>
