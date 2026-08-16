@@ -1,48 +1,49 @@
 const express = require('express');
-const axios = require('axios');
 const cors = require('cors');
+const fetch = require('node-fetch');
 
 const app = express();
 app.use(cors());
 
-// Función para obtener tasa de Binance P2P
-async function obtenerTasaBinance(fiat) {
+async function obtenerTasaBinanceP2P(fiat, tradeType) {
   try {
-    const response = await axios.post('https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search', {
-      asset: "USDT",
-      fiat: fiat,
-      merchantCheck: false,
-      page: 1,
-      rows: 5,
-      tradeType: "BUY"
+    const response = await fetch('https://p2p.binance.com/bapi/c2c/v1/friendly/c2c/ad/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        asset: 'USDT',
+        fiat: fiat,
+        merchantCheck: false,
+        page: 1,
+        rows: 5,
+        tradeType: tradeType // "BUY" para cuando el cliente paga en Fiat, "SELL" para cuando recibe Fiat
+      })
     });
-
-    const ofertas = response.data.data;
-    if (!ofertas || ofertas.length === 0) return 0;
-
-    const suma = ofertas.reduce((acc, curr) => acc + parseFloat(curr.adv.price), 0);
-    return suma / ofertas.length;
-  } catch (error) {
-    console.error(`Error consultando Binance (${fiat}):`, error.message);
-    return 0;
+    const data = await response.json();
+    if (data && data.data && data.data.length > 0) {
+      const precios = data.data.slice(0, 3).map(ad => parseFloat(ad.adv.price));
+      return precios.reduce((a, b) => a + b, 0) / precios.length;
+    }
+  } catch (e) {
+    console.error(`Error en Binance P2P para ${fiat} (${tradeType}):`, e);
   }
+  return null;
 }
 
-// Endpoint para entregar las tasas
 app.get('/api/tasas', async (req, res) => {
-  const [vesUsdt, copUsdt] = await Promise.all([
-    obtenerTasaBinance('VES'),
-    obtenerTasaBinance('COP')
-  ]);
+  const vesUsdt = await obtenerTasaBinanceP2P('VES', 'BUY') || 882;
+  const copUsdtBuy = await obtenerTasaBinanceP2P('COP', 'BUY') || 3135;   // Tasa de compra P2P
+  const copUsdtSell = await obtenerTasaBinanceP2P('COP', 'SELL') || 3105; // Tasa de venta P2P
 
   res.json({
     success: true,
     tasas: {
-      VES_USDT: parseFloat(vesUsdt.toFixed(2)) || 882,
-      COP_USDT: parseFloat(copUsdt.toFixed(2)) || 3140
+      VES_USDT: vesUsdt,
+      COP_USDT_BUY: copUsdtBuy,
+      COP_USDT_SELL: copUsdtSell
     }
   });
 });
 
-const PORT = 3000;
-app.listen(PORT, () => console.log(`Servidor de tasas activo en http://localhost:${PORT}`));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Servidor de tasas activo en puerto ${PORT}`));
