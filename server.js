@@ -1,26 +1,28 @@
+'use strict';
+
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '8kb' }));
 app.disable('x-powered-by');
 
-const BINANCE_ADS_URL = 'https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search';
-const BINANCE_TIMEOUT_MS = Number(process.env.BINANCE_TIMEOUT_MS || 10000);
-const OFFERS_TO_REQUEST = Math.min(20, Math.max(5, Number(process.env.BINANCE_ADS_LIMIT || 20)));
+// Endpoint público usado por la interfaz P2P de Binance. La búsqueda es POST;
+// el endpoint antiguo GET /agent/ad-list devolvía resultados incompletos.
+const BINANCE_ADS_URL = 'https://www.binance.com/bapi/c2c/v2/friendly/c2c/adv/search';
+const BINANCE_TIMEOUT_MS = Number(process.env.BINANCE_TIMEOUT_MS || 12000);
+const OFFERS_TO_REQUEST = Math.min(20, Math.max(10, Number(process.env.BINANCE_ADS_LIMIT || 20)));
 const OFFERS_TO_MEDIAN = Math.min(10, Math.max(3, Number(process.env.BINANCE_OFFERS_TO_MEDIAN || 5)));
 const MIN_COMPLETION_RATE = Number(process.env.BINANCE_MIN_COMPLETION_RATE || 90);
 const MIN_MONTH_ORDERS = Number(process.env.BINANCE_MIN_MONTH_ORDERS || 20);
-const MIN_VALID_OFFERS = Math.max(1, Number(process.env.BINANCE_MIN_VALID_OFFERS || 3));
-
+// Dos anuncios de buena calidad permiten calcular mediana sin bloquear una tasa
+// solo porque un mercado tenga poca liquidez. Nunca se usa una tasa antigua.
+const MIN_VALID_OFFERS = Math.max(2, Number(process.env.BINANCE_MIN_VALID_OFFERS || 2));
 const REFERENCE_AMOUNT = {
   VES: Number(process.env.REFERENCE_AMOUNT_VES || 100000),
   COP: Number(process.env.REFERENCE_AMOUNT_COP || 315000)
 };
-
-// Configure Binance payment-type identifiers only if you know the exact identifiers.
 const PAYMENT_METHODS = {
   VES: (process.env.BINANCE_PAY_TYPES_VES || '').split(',').map(x => x.trim()).filter(Boolean),
   COP: (process.env.BINANCE_PAY_TYPES_COP || '').split(',').map(x => x.trim()).filter(Boolean)
@@ -28,124 +30,111 @@ const PAYMENT_METHODS = {
 
 function num(value) {
   if (value === null || value === undefined || value === '') return null;
-  const normalized = typeof value === 'string' ? value.trim().replace(/%$/, '') : value;
-  const n = Number(normalized);
+  const n = Number(typeof value === 'string' ? value.trim().replace(/%$/, '') : value);
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 function percent(value) {
   const n = num(value);
-  if (n === null) return null;
-  return n <= 1 ? n * 100 : n;
+  return n === null ? null : (n <= 1 ? n * 100 : n);
 }
 function first(...values) {
-  for (const value of values) {
-    const n = num(value);
-    if (n !== null) return n;
-  }
+  for (const v of values) { const n = num(v); if (n !== null) return n; }
   return null;
 }
 function unwrapOffers(payload) {
-  const roots = [
-    payload?.data?.data, payload?.data?.list, payload?.data?.items,
-    payload?.data?.advList, payload?.data?.rows, payload?.data,
-    payload?.list, payload?.items, payload?.rows
-  ];
+  const roots = [payload?.data?.data, payload?.data?.list, payload?.data?.items,
+    payload?.data?.advList, payload?.data, payload?.list, payload?.items];
   for (const candidate of roots) {
     if (Array.isArray(candidate)) return candidate;
     if (candidate && typeof candidate === 'object') {
-      for (const key of ['data', 'list', 'items', 'advList', 'rows']) {
+      for (const key of ['data', 'list', 'items', 'advList', 'rows'])
         if (Array.isArray(candidate[key])) return candidate[key];
-      }
     }
   }
   return [];
 }
 function normalizeOffer(item) {
   const adv = item?.adv || item?.advertisement || item?.advDetail || item || {};
-  const advertiser = item?.advertiser || item?.user || item?.merchant || {};
+  const advertiser = item?.advertiser || item?.user || item?.advertiserInfo || {};
   const price = first(adv.price, item.price, adv.advPrice);
   const min = first(adv.minSingleTransAmount, adv.minAmount, adv.minLimit,
-    adv.minSingleTransQuantity, item.minSingleTransAmount, item.minAmount, item.minLimit);
+    item.minSingleTransAmount, item.minAmount, item.minLimit);
   const max = first(adv.maxSingleTransAmount, adv.maxAmount, adv.maxLimit,
-    adv.maxSingleTransQuantity, item.maxSingleTransAmount, item.maxAmount, item.maxLimit);
+    item.maxSingleTransAmount, item.maxAmount, item.maxLimit);
   const completion = percent(advertiser.monthFinishRate ?? advertiser.completionRate ??
-    advertiser.monthFinishRateText ?? item.monthFinishRate ?? item.completionRate);
+    item.monthFinishRate ?? item.completionRate ?? advertiser.tradeFinishRate);
   const monthOrders = first(advertiser.monthOrderCount, advertiser.monthFinishCount,
-    advertiser.monthOrderCountText, item.monthOrderCount, item.monthFinishCount);
-  const rawMethods = adv.tradeMethods || adv.tradeMethodList || adv.payTypes ||
-    item.tradeMethods || item.tradeMethodList || item.payTypes || [];
-  const paymentMethods = Array.isArray(rawMethods) ? rawMethods.map(m =>
-    String(m?.identifier || m?.tradeMethodIdentifier || m?.payType || m?.tradeMethodName || m?.name || '').trim()
+    item.monthOrderCount, item.monthFinishCount, advertiser.monthTradeCount);
+  const methods = adv.tradeMethods || adv.tradeMethodList || item.tradeMethods || [];
+  const paymentMethods = Array.isArray(methods) ? methods.map(m =>
+    String(m?.identifier || m?.tradeMethodIdentifier || m?.payType || m?.tradeMethodName || '').trim()
   ).filter(Boolean) : [];
   return { price, min, max, completion, monthOrders, paymentMethods };
 }
 
 async function obtenerTasaBinance(fiat, tradeType) {
+  const referenceAmount = REFERENCE_AMOUNT[fiat];
+  const payTypes = PAYMENT_METHODS[fiat] || [];
+  const diagnostic = { raw: 0, valid: 0, rejected: {} };
   try {
-    const payTypes = PAYMENT_METHODS[fiat] || [];
     const body = {
-      fiat,
-      page: 1,
-      rows: OFFERS_TO_REQUEST,
-      tradeType,
-      asset: 'USDT',
-      countries: [],
-      proMerchantAds: false,
-      shieldMerchantAds: false,
-      publisherType: null,
-      payTypes
+      asset: 'USDT', fiat, tradeType, page: 1, rows: OFFERS_TO_REQUEST,
+      transAmount: String(referenceAmount), payTypes,
+      publisherType: null, merchantCheck: false, countries: [],
+      proMerchantAds: false, shieldMerchantAds: false,
+      filterType: 'all', periods: [], additionalKycVerifyFilter: 0,
+      classifies: ['mass', 'profession']
     };
     const response = await axios.post(BINANCE_ADS_URL, body, {
       timeout: BINANCE_TIMEOUT_MS,
       headers: {
-        Accept: 'application/json',
+        Accept: 'application/json, text/plain, */*',
         'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0',
-        'clienttype': 'web'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
+        'clienttype': 'web', 'lang': 'en'
       }
     });
     const payload = response.data;
-    if (payload?.success === false || (payload?.code && payload.code !== '000000')) {
-      throw new Error(`Binance rechazó la consulta (${payload?.code || 'sin código'})`);
-    }
+    if (payload?.success === false || (payload?.code && payload.code !== '000000'))
+      throw new Error(`Binance rechazó la consulta (${payload?.code || 'sin código'}): ${payload?.message || payload?.msg || 'sin detalle'}`);
 
-    const referenceAmount = REFERENCE_AMOUNT[fiat];
-    const rawOffers = unwrapOffers(payload);
-    const normalized = rawOffers.map(normalizeOffer);
-    const offers = normalized.filter(o => {
-      if (!o.price || !o.min || !o.max || o.max < o.min) return false;
-      if (referenceAmount > 0 && !(o.min <= referenceAmount && o.max >= referenceAmount)) return false;
-      // If quality fields are present, enforce the thresholds. Missing quality data
-      // remains ineligible so the service never silently trusts an unknown advertiser.
-      if (o.completion === null || o.completion < MIN_COMPLETION_RATE) return false;
-      if (o.monthOrders === null || o.monthOrders < MIN_MONTH_ORDERS) return false;
-      if (payTypes.length && !payTypes.some(type => o.paymentMethods.includes(type))) return false;
-      return true;
-    });
+    const raw = unwrapOffers(payload);
+    diagnostic.raw = raw.length;
+    const normalized = raw.map(normalizeOffer);
+    const offers = [];
+    for (const o of normalized) {
+      let reason = '';
+      if (!o.price) reason = 'sin_precio';
+      else if (o.min === null || o.max === null || o.max < o.min) reason = 'limites_no_disponibles';
+      else if (!(o.min <= referenceAmount && o.max >= referenceAmount)) reason = 'importe_fuera_de_limites';
+      else if (o.completion === null) reason = 'sin_dato_finalizacion';
+      else if (o.completion < MIN_COMPLETION_RATE) reason = 'finalizacion_baja';
+      else if (o.monthOrders === null) reason = 'sin_dato_operaciones';
+      else if (o.monthOrders < MIN_MONTH_ORDERS) reason = 'pocas_operaciones';
+      else if (payTypes.length && !payTypes.some(t => o.paymentMethods.includes(t))) reason = 'metodo_pago_no_coincide';
+      if (reason) diagnostic.rejected[reason] = (diagnostic.rejected[reason] || 0) + 1;
+      else offers.push(o);
+    }
+    diagnostic.valid = offers.length;
+    console.log(`Binance ${fiat}/${tradeType}: raw=${diagnostic.raw}, valid=${diagnostic.valid}, rechazados=${JSON.stringify(diagnostic.rejected)}`);
 
     if (offers.length < MIN_VALID_OFFERS) {
-      console.error(`Binance ${fiat}/${tradeType}: raw=${rawOffers.length}, normalized=${normalized.length}, valid=${offers.length}`);
-      throw new Error(`Anuncios válidos insuficientes para ${fiat}/${tradeType} (${offers.length}/${MIN_VALID_OFFERS}).`);
+      return { ok: false, diagnostic, error: `Solo hay ${offers.length} anuncios válidos para ${fiat}/${tradeType}; se requieren ${MIN_VALID_OFFERS}.` };
     }
-
-    // BUY: el cliente compra USDT y busca el menor precio fiat/USDT.
-    // SELL: el cliente vende USDT y busca el mayor precio fiat/USDT.
+    // Precio competitivo: comprar USDT usa los anuncios más baratos; vender USDT,
+    // los más caros. La mediana evita depender de un único anuncio extremo.
     offers.sort((a, b) => tradeType === 'BUY' ? a.price - b.price : b.price - a.price);
-    const competitive = offers.slice(0, OFFERS_TO_MEDIAN).map(o => o.price).sort((a, b) => a - b);
-    const middle = Math.floor(competitive.length / 2);
-    const price = competitive.length % 2
-      ? competitive[middle]
-      : (competitive[middle - 1] + competitive[middle]) / 2;
-
-    return { price, validOffers: offers.length, sampled: competitive.length, referenceAmount };
+    const sample = offers.slice(0, OFFERS_TO_MEDIAN).map(o => o.price).sort((a, b) => a - b);
+    const mid = Math.floor(sample.length / 2);
+    const price = sample.length % 2 ? sample[mid] : (sample[mid - 1] + sample[mid]) / 2;
+    return { ok: true, price, validOffers: offers.length, sampled: sample.length, referenceAmount, diagnostic };
   } catch (error) {
-    console.error(`Error Binance P2P ${fiat}/${tradeType}:`, error.message);
-    return null;
+    console.error(`Error Binance P2P ${fiat}/${tradeType}: ${error.message}`);
+    return { ok: false, diagnostic, error: error.message };
   }
 }
-
-function tasaFinal(valor) {
-  return Number.isFinite(valor) && valor > 0 ? Number(valor.toFixed(2)) : null;
+function tasaFinal(value) {
+  return Number.isFinite(value) && value > 0 ? Number(value.toFixed(2)) : null;
 }
 
 app.get('/api/tasas', async (_req, res) => {
@@ -153,42 +142,27 @@ app.get('/api/tasas', async (_req, res) => {
     obtenerTasaBinance('VES', 'BUY'), obtenerTasaBinance('VES', 'SELL'),
     obtenerTasaBinance('COP', 'BUY'), obtenerTasaBinance('COP', 'SELL')
   ]);
-  const tasas = {
-    VES_USDT_BUY: tasaFinal(vesBuy?.price),
-    VES_USDT_SELL: tasaFinal(vesSell?.price),
-    COP_USDT_BUY: tasaFinal(copBuy?.price),
-    COP_USDT_SELL: tasaFinal(copSell?.price)
-  };
-  const enVivo = {
-    VES_USDT_BUY: Boolean(vesBuy), VES_USDT_SELL: Boolean(vesSell),
-    COP_USDT_BUY: Boolean(copBuy), COP_USDT_SELL: Boolean(copSell)
-  };
+  const results = { VES_USDT_BUY: vesBuy, VES_USDT_SELL: vesSell, COP_USDT_BUY: copBuy, COP_USDT_SELL: copSell };
+  const tasas = Object.fromEntries(Object.entries(results).map(([k, v]) => [k, tasaFinal(v?.price)]));
+  const enVivo = Object.fromEntries(Object.entries(results).map(([k, v]) => [k, Boolean(v?.ok && tasas[k] !== null)]));
   const todoEnVivo = Object.values(enVivo).every(Boolean);
   const metadata = {
-    fuente: 'Binance P2P friendly/c2c/adv/search',
-    criterio: `Mediana de hasta ${OFFERS_TO_MEDIAN} anuncios competitivos; importe dentro de límites, finalización mínima ${MIN_COMPLETION_RATE}%, mínimo ${MIN_MONTH_ORDERS} operaciones mensuales y al menos ${MIN_VALID_OFFERS} anuncios válidos.`,
+    fuente: 'Binance P2P public adv/search',
+    criterio: `Mediana de hasta ${OFFERS_TO_MEDIAN} anuncios competitivos; importe de referencia, finalización mínima ${MIN_COMPLETION_RATE}%, mínimo ${MIN_MONTH_ORDERS} operaciones mensuales y al menos ${MIN_VALID_OFFERS} anuncios válidos.`,
     importesReferencia: REFERENCE_AMOUNT,
-    metodosPagoFiltrados: {
-      VES: PAYMENT_METHODS.VES.length ? PAYMENT_METHODS.VES : null,
-      COP: PAYMENT_METHODS.COP.length ? PAYMENT_METHODS.COP : null
-    },
-    anunciosValidos: {
-      VES_USDT_BUY: vesBuy?.validOffers || 0,
-      VES_USDT_SELL: vesSell?.validOffers || 0,
-      COP_USDT_BUY: copBuy?.validOffers || 0,
-      COP_USDT_SELL: copSell?.validOffers || 0
-    }
+    metodosPagoFiltrados: { VES: PAYMENT_METHODS.VES.length ? PAYMENT_METHODS.VES : null, COP: PAYMENT_METHODS.COP.length ? PAYMENT_METHODS.COP : null },
+    anunciosValidos: Object.fromEntries(Object.entries(results).map(([k, v]) => [k, v?.diagnostic?.valid || 0])),
+    diagnostico: Object.fromEntries(Object.entries(results).map(([k, v]) => [k, v?.diagnostic || null]))
   };
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  const actualizado = new Date().toISOString();
   if (!todoEnVivo) {
-    return res.status(503).json({
-      success: false, tasas, enVivo, metadata, actualizado: new Date().toISOString(),
-      error: 'No se encontraron suficientes anuncios P2P válidos para una o más cotizaciones. No se usa una tasa antigua.'
-    });
+    return res.status(503).json({ success: false, tasas, enVivo, metadata, actualizado,
+      error: 'Una o más cotizaciones no están disponibles en Binance P2P. No se usa una tasa antigua.',
+      errores: Object.fromEntries(Object.entries(results).filter(([, v]) => !v?.ok).map(([k, v]) => [k, v?.error || 'Cotización no disponible'])) });
   }
-  return res.json({ success: true, tasas, enVivo, metadata, actualizado: new Date().toISOString() });
+  return res.json({ success: true, tasas, enVivo, metadata, actualizado });
 });
-
 app.get('/health', (_req, res) => res.json({ ok: true, servicio: 'Remex L.A. - Tasas P2P' }));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Servidor de tasas Remex L.A. activo en puerto ${PORT}`));
